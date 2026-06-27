@@ -569,6 +569,17 @@ html.dark {
   color: var(--color-text);
 }
 
+.prose .tiptap-mathematics-render[data-type="inline-math"] {
+  display: inline;
+  padding: 0 0.15em;
+  border-radius: 0.2rem;
+  cursor: pointer;
+}
+
+.prose .tiptap-mathematics-render[data-type="inline-math"]:hover {
+  background-color: var(--color-bg-muted);
+}
+
 .prose .tiptap-mathematics-render[data-type="block-math"] {
   display: block;
   margin: 0.75rem 0;
