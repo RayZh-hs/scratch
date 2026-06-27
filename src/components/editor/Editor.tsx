@@ -77,6 +77,7 @@ import {
   hasInlineCompletionGhostText,
   showInlineCompletionGhostText,
 } from "./InlineCompletionGhostText";
+import { ScratchInlineMath } from "./InlineMathExtension";
 import { cn } from "../../lib/utils";
 import { plainTextFromMarkdown } from "../../lib/plainText";
 import {
@@ -1282,6 +1283,13 @@ export function Editor({
           handleEditBlockMath(pos);
         },
       }),
+      ScratchInlineMath.configure({
+        katexOptions: {
+          throwOnError: false,
+          displayMode: false,
+          macros: katexMacros,
+        },
+      }),
     ],
     editorProps: {
       attributes: {
@@ -1407,7 +1415,7 @@ export function Editor({
 
         // Check if text looks like markdown (has common markdown patterns)
         const markdownPatterns =
-          /^#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|```|^\s*\[.*\]\(.*\)|^\s*!\[|\*\*.*\*\*|__.*__|~~.*~~|^\s*[-*_]{3,}\s*$|^\|.+\||\$\$[\s\S]+?\$\$/m;
+          /^#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|```|^\s*\[.*\]\(.*\)|^\s*!\[|\*\*.*\*\*|__.*__|~~.*~~|^\s*[-*_]{3,}\s*$|^\|.+\||\$\$[\s\S]+?\$\$|(?<!\$)\$[^$\n]+\$(?!\$)/m;
         if (!markdownPatterns.test(text)) {
           // Not markdown, let TipTap handle it normally
           return false;
