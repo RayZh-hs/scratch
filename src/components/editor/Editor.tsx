@@ -69,10 +69,23 @@ import { Wikilink, type WikilinkStorage } from "./Wikilink";
 import { WikilinkSuggestion } from "./WikilinkSuggestion";
 import { EditorWidthHandles } from "./EditorWidthHandle";
 import { ScratchBlockMath, normalizeBlockMath } from "./MathExtensions";
+import {
+  InlineCompletionGhostText,
+  acceptInlineCompletionGhostText,
+  acceptInlineCompletionGhostTextWord,
+  clearInlineCompletionGhostText,
+  hasInlineCompletionGhostText,
+  showInlineCompletionGhostText,
+} from "./InlineCompletionGhostText";
 import { cn } from "../../lib/utils";
 import { plainTextFromMarkdown } from "../../lib/plainText";
+import {
+  normalizeInlineCompletionShortcuts,
+  shortcutMatchesEvent,
+} from "../../lib/shortcuts";
 import { Button, IconButton, ToolbarButton, Tooltip } from "../ui";
 import * as notesService from "../../services/notes";
+import * as aiService from "../../services/ai";
 import { downloadPdf, downloadMarkdown } from "../../services/pdf";
 import type { Settings } from "../../types/note";
 import {
@@ -552,6 +565,8 @@ export function Editor({
   const [, setSelectionKey] = useState(0);
   const [copyMenuOpen, setCopyMenuOpen] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const settingsRef = useRef<Settings | null>(null);
+  settingsRef.current = settings;
   // Delay transition classes until after initial mount to avoid format bar height animation on note load
   const [hasTransitioned, setHasTransitioned] = useState(false);
   useEffect(() => {
@@ -587,6 +602,9 @@ export function Editor({
   const isLoadingRef = useRef(false);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<TiptapEditor | null>(null);
+  const inlineCompletionRequestIdRef = useRef(0);
+  // Pending debounce timer for "pause"-based inline completion triggers
+  const inlineAutoTriggerTimerRef = useRef<number | null>(null);
   const currentNoteIdRef = useRef<string | null>(null);
   // Track if we need to save (use ref to avoid computing markdown on every keystroke)
   const needsSaveRef = useRef(false);
@@ -616,17 +634,34 @@ export function Editor({
     [],
   );
 
+  const loadEditorSettings = useCallback(() => {
+    if (!currentNote?.id || previewMode) return;
+    notesService
+      .getSettings()
+      .then((nextSettings) => {
+        console.info("[EditorSettings] loaded", {
+          hasInlineCompletion: Boolean(nextSettings.inlineCompletion),
+          hasInlineCompletionShortcuts: Boolean(
+            nextSettings.inlineCompletionShortcuts,
+          ),
+        });
+        setSettings(nextSettings);
+      })
+      .catch((error) => {
+        console.error("Failed to load settings:", error);
+      });
+  }, [currentNote?.id, previewMode]);
+
   // Load settings when note changes or notes are refreshed (e.g., after pin/unpin)
   useEffect(() => {
-    if (currentNote?.id && !previewMode) {
-      notesService
-        .getSettings()
-        .then(setSettings)
-        .catch((error) => {
-          console.error("Failed to load settings:", error);
-        });
-    }
-  }, [currentNote?.id, notes, previewMode]);
+    loadEditorSettings();
+  }, [loadEditorSettings, notes]);
+
+  useEffect(() => {
+    window.addEventListener("settings-updated", loadEditorSettings);
+    return () =>
+      window.removeEventListener("settings-updated", loadEditorSettings);
+  }, [loadEditorSettings]);
 
   // Calculate if current note is pinned
   const isPinned =
@@ -1043,6 +1078,125 @@ export function Editor({
     });
   }, [closeBlockMathPopup, handleEditBlockMath]);
 
+  const requestInlineCompletion = useCallback(async () => {
+    const currentEditor = editorRef.current;
+    if (!currentEditor) {
+      console.info("[InlineCompletionGhostText] skipped; editor is not ready");
+      return;
+    }
+
+    const inlineSettings = settingsRef.current?.inlineCompletion;
+    const activeProvider = inlineSettings?.activeProvider ?? "disabled";
+    console.info("[InlineCompletionGhostText] trigger", {
+      activeProvider,
+    });
+
+    if (activeProvider === "disabled") {
+      console.info("[InlineCompletionGhostText] skipped; provider is disabled");
+      return;
+    }
+
+    if (!currentEditor.state.selection.empty) {
+      console.info("[InlineCompletionGhostText] skipped; selection is not empty");
+      return;
+    }
+
+    const { from } = currentEditor.state.selection;
+    const requestId = Date.now();
+    inlineCompletionRequestIdRef.current = requestId;
+    clearInlineCompletionGhostText(currentEditor, "new-request");
+
+    const doc = currentEditor.state.doc;
+    const rawPrefix = doc.textBetween(0, from, "\n\n");
+    const rawSuffix = doc.textBetween(from, doc.content.size, "\n\n");
+    const prefix = rawPrefix.slice(-4000);
+    const suffix = rawSuffix.slice(0, 1000);
+
+    console.info("[InlineCompletionGhostText] provider request", {
+      requestId,
+      activeProvider,
+      cursor: from,
+      prefixChars: prefix.length,
+      suffixChars: suffix.length,
+    });
+
+    try {
+      const result = await aiService.executeInlineCompletion({
+        prefix,
+        suffix,
+        noteTitle: currentNote?.title,
+      });
+
+      if (inlineCompletionRequestIdRef.current !== requestId) {
+        console.info("[InlineCompletionGhostText] ignored stale response", {
+          requestId,
+        });
+        return;
+      }
+
+      if (currentEditor.state.selection.from !== from) {
+        console.info(
+          "[InlineCompletionGhostText] ignored response after cursor moved",
+          {
+            requestId,
+            originalCursor: from,
+            currentCursor: currentEditor.state.selection.from,
+          },
+        );
+        return;
+      }
+
+      if (!result.success) {
+        console.info("[InlineCompletionGhostText] provider returned no suggestion", {
+          requestId,
+          error: result.error,
+        });
+        return;
+      }
+
+      showInlineCompletionGhostText(
+        currentEditor,
+        result.completion,
+        requestId,
+      );
+    } catch (err) {
+      console.error("[InlineCompletionGhostText] provider request failed", err);
+    }
+  }, [currentNote?.title]);
+
+  // Request a completion automatically, but only when it makes sense: editor is
+  // focused, cursor is a collapsed caret, a provider is active, and there isn't
+  // already a suggestion visible (so we don't clobber one the user is reading).
+  const maybeAutoRequestInline = useCallback(() => {
+    const currentEditor = editorRef.current;
+    if (!currentEditor || isLoadingRef.current) return;
+    if (!currentEditor.isFocused) return;
+
+    const inline = settingsRef.current?.inlineCompletion;
+    if (!inline || (inline.activeProvider ?? "disabled") === "disabled") return;
+    if (!currentEditor.state.selection.empty) return;
+    if (hasInlineCompletionGhostText(currentEditor)) return;
+
+    void requestInlineCompletion();
+  }, [requestInlineCompletion]);
+
+  // (Re)arm the debounce timer for "pause"-based triggers. No-op for other
+  // trigger policies. Reads the current trigger from settingsRef so it stays in
+  // sync without re-binding editor listeners.
+  const scheduleInlinePauseTrigger = useCallback(() => {
+    const trigger = settingsRef.current?.inlineCompletion?.trigger ?? "manual";
+    if (trigger !== "pause1s" && trigger !== "pause5s") return;
+
+    if (inlineAutoTriggerTimerRef.current) {
+      clearTimeout(inlineAutoTriggerTimerRef.current);
+    }
+    const delay = trigger === "pause1s" ? 1000 : 5000;
+    inlineAutoTriggerTimerRef.current = window.setTimeout(() => {
+      inlineAutoTriggerTimerRef.current = null;
+      maybeAutoRequestInline();
+    }, delay);
+  }, [maybeAutoRequestInline]);
+
   const editor = useEditor({
     textDirection,
     extensions: [
@@ -1114,6 +1268,7 @@ export function Editor({
         matches: [],
         currentIndex: 0,
       }),
+      InlineCompletionGhostText,
       SlashCommand,
       Wikilink,
       WikilinkSuggestion,
@@ -1153,8 +1308,41 @@ export function Editor({
           return fallback;
         }
       },
-      // Trap Tab key inside the editor
       handleKeyDown: (_view, event) => {
+        const inlineShortcuts = normalizeInlineCompletionShortcuts(
+          settingsRef.current?.inlineCompletionShortcuts,
+        );
+
+        if (shortcutMatchesEvent(inlineShortcuts.trigger, event)) {
+          event.preventDefault();
+          void requestInlineCompletion();
+          return true;
+        }
+
+        if (
+          shortcutMatchesEvent(inlineShortcuts.accept, event) &&
+          hasInlineCompletionGhostText(editorRef.current)
+        ) {
+          event.preventDefault();
+          return acceptInlineCompletionGhostText(editorRef.current);
+        }
+
+        if (
+          shortcutMatchesEvent(inlineShortcuts.acceptWord, event) &&
+          hasInlineCompletionGhostText(editorRef.current)
+        ) {
+          event.preventDefault();
+          return acceptInlineCompletionGhostTextWord(editorRef.current);
+        }
+
+        if (
+          shortcutMatchesEvent(inlineShortcuts.dismiss, event) &&
+          clearInlineCompletionGhostText(editorRef.current, "escape")
+        ) {
+          event.preventDefault();
+          return true;
+        }
+
         if (event.key === "Tab") {
           // Allow default tab behavior (indent in lists, etc.)
           // but prevent focus from leaving the editor
@@ -1253,6 +1441,9 @@ export function Editor({
       scheduleSave();
     },
     onSelectionUpdate: () => {
+      // Ghost text dismissal on cursor movement is handled inside the
+      // InlineCompletionGhostText plugin so that "type-through" edits (which
+      // also move the cursor) keep the remaining suggestion visible.
       // Trigger re-render to update toolbar active states
       setSelectionKey((k) => k + 1);
     },
@@ -1273,6 +1464,38 @@ export function Editor({
   useEffect(() => {
     onEditorReady?.(editor);
   }, [editor, onEditorReady]);
+
+  // "Pause"-based inline completion: re-arm the debounce on every edit and
+  // cursor move; it fires once the user has been idle for the configured delay.
+  useEffect(() => {
+    if (!editor) return;
+    const handler = () => scheduleInlinePauseTrigger();
+    editor.on("update", handler);
+    editor.on("selectionUpdate", handler);
+    return () => {
+      editor.off("update", handler);
+      editor.off("selectionUpdate", handler);
+    };
+  }, [editor, scheduleInlinePauseTrigger]);
+
+  // "Interval"-based inline completion: fire on a fixed cadence. Also cancels
+  // any pending pause timer whenever the active trigger policy changes.
+  const inlineTrigger = settings?.inlineCompletion?.trigger ?? "manual";
+  const inlineActiveProvider =
+    settings?.inlineCompletion?.activeProvider ?? "disabled";
+  useEffect(() => {
+    if (inlineAutoTriggerTimerRef.current) {
+      clearTimeout(inlineAutoTriggerTimerRef.current);
+      inlineAutoTriggerTimerRef.current = null;
+    }
+
+    if (!editor || inlineActiveProvider === "disabled") return;
+    if (inlineTrigger !== "interval1s" && inlineTrigger !== "interval5s") return;
+
+    const delay = inlineTrigger === "interval1s" ? 1000 : 5000;
+    const id = window.setInterval(() => maybeAutoRequestInline(), delay);
+    return () => clearInterval(id);
+  }, [editor, inlineTrigger, inlineActiveProvider, maybeAutoRequestInline]);
 
   // Sync notes list into editor storage for wikilink autocomplete
   useEffect(() => {
@@ -1530,6 +1753,9 @@ export function Editor({
     return () => {
       if (saveTimeoutRef.current) {
         clearTimeout(saveTimeoutRef.current);
+      }
+      if (inlineAutoTriggerTimerRef.current) {
+        clearTimeout(inlineAutoTriggerTimerRef.current);
       }
       // Flush any pending save before unmounting
       if (needsSaveRef.current && editorRef.current) {

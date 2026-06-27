@@ -12,6 +12,7 @@ dependencies = [
  "notify",
  "open",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tantivy",

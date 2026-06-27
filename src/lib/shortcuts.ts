@@ -1,4 +1,5 @@
 import { mod, shift } from "./platform";
+import type { InlineCompletionShortcutSettings } from "../types/note";
 
 export interface Shortcut {
   keys: string[];
@@ -8,6 +9,84 @@ export interface Shortcut {
 export interface ShortcutCategory {
   title: string;
   shortcuts: Shortcut[];
+}
+
+export const defaultInlineCompletionShortcuts: Required<InlineCompletionShortcutSettings> = {
+  trigger: [mod, "J"],
+  accept: ["Tab"],
+  acceptWord: ["Ctrl", "→"],
+  dismiss: ["Esc"],
+};
+
+export function normalizeInlineCompletionShortcuts(
+  shortcuts?: InlineCompletionShortcutSettings,
+): Required<InlineCompletionShortcutSettings> {
+  return {
+    ...defaultInlineCompletionShortcuts,
+    ...(shortcuts ?? {}),
+  };
+}
+
+export function formatShortcutKeys(keys: string[]): string {
+  return keys.join("+");
+}
+
+function normalizeKeyLabel(label: string): string {
+  const trimmed = label.trim();
+  const lower = trimmed.toLowerCase();
+  if (["cmd", "command", "⌘", "meta"].includes(lower)) return "⌘";
+  if (["ctrl", "control", "^"].includes(lower)) return "Ctrl";
+  if (["shift", "⇧"].includes(lower)) return shift;
+  if (["alt", "option", "opt", "⌥"].includes(lower)) return "Alt";
+  if (["esc", "escape"].includes(lower)) return "Esc";
+  if (["tab"].includes(lower)) return "Tab";
+  if (["enter", "return"].includes(lower)) return "Enter";
+  if (["right", "arrowright", "→"].includes(lower)) return "→";
+  if (["left", "arrowleft", "←"].includes(lower)) return "←";
+  if (["up", "arrowup", "↑"].includes(lower)) return "↑";
+  if (["down", "arrowdown", "↓"].includes(lower)) return "↓";
+  if (trimmed.length === 1) return trimmed.toUpperCase();
+  return trimmed;
+}
+
+export function parseShortcutInput(value: string): string[] {
+  return value
+    .split("+")
+    .map(normalizeKeyLabel)
+    .filter(Boolean);
+}
+
+function eventKeyLabel(event: KeyboardEvent): string {
+  if (event.key === "ArrowRight") return "→";
+  if (event.key === "ArrowLeft") return "←";
+  if (event.key === "ArrowUp") return "↑";
+  if (event.key === "ArrowDown") return "↓";
+  if (event.key === "Escape") return "Esc";
+  if (event.key.length === 1) return event.key.toUpperCase();
+  return normalizeKeyLabel(event.key);
+}
+
+export function shortcutMatchesEvent(
+  keys: string[],
+  event: KeyboardEvent,
+): boolean {
+  const normalized = keys.map(normalizeKeyLabel);
+  const wantsMeta = normalized.includes("⌘");
+  const wantsCtrl = normalized.includes("Ctrl");
+  const wantsShift = normalized.includes(shift);
+  const wantsAlt = normalized.includes("Alt");
+  const primaryKey = normalized.find(
+    (key) => !["⌘", "Ctrl", shift, "Alt"].includes(key),
+  );
+
+  return (
+    Boolean(primaryKey) &&
+    eventKeyLabel(event) === primaryKey &&
+    event.metaKey === wantsMeta &&
+    event.ctrlKey === wantsCtrl &&
+    event.shiftKey === wantsShift &&
+    event.altKey === wantsAlt
+  );
 }
 
 export const shortcutCategories: ShortcutCategory[] = [

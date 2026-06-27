@@ -20,6 +20,21 @@ export interface ThemeSettings {
 export type FontFamily = "system-sans" | "serif" | "monospace";
 export type TextDirection = "auto" | "ltr" | "rtl";
 export type EditorWidth = "narrow" | "normal" | "wide" | "full" | "custom";
+export type InlineCompletionProviderId =
+  | "disabled"
+  | "openai-compatible"
+  | "anthropic"
+  | "ollama";
+
+// When to automatically request inline completions.
+// "manual" only fires on the trigger shortcut; "pause*" debounce after the user
+// stops editing; "interval*" fire on a fixed cadence.
+export type InlineCompletionTrigger =
+  | "manual"
+  | "pause1s"
+  | "pause5s"
+  | "interval1s"
+  | "interval5s";
 
 export interface EditorFontSettings {
   baseFontFamily?: FontFamily;
@@ -43,6 +58,29 @@ export type ThemeColorKey =
 // Partial map of color overrides (hex strings)
 export type CustomColors = Partial<Record<ThemeColorKey, string>>;
 
+export interface InlineCompletionProviderSettings {
+  enabled?: boolean;
+  endpoint?: string;
+  apiKey?: string;
+  model?: string;
+}
+
+export interface InlineCompletionSettings {
+  enabled?: boolean;
+  activeProvider?: InlineCompletionProviderId;
+  trigger?: InlineCompletionTrigger;
+  providers?: Partial<
+    Record<InlineCompletionProviderId, InlineCompletionProviderSettings>
+  >;
+}
+
+export interface InlineCompletionShortcutSettings {
+  trigger?: string[];
+  accept?: string[];
+  acceptWord?: string[];
+  dismiss?: string[];
+}
+
 // Per-folder settings (stored in .scratch/settings.json)
 export interface Settings {
   theme: ThemeSettings;
@@ -56,6 +94,8 @@ export interface Settings {
   defaultNoteName?: string;
   interfaceZoom?: number;
   ollamaModel?: string;
+  inlineCompletion?: InlineCompletionSettings;
+  inlineCompletionShortcuts?: InlineCompletionShortcutSettings;
   ignoredPatterns?: string[];
   customColorsLight?: CustomColors;
   customColorsDark?: CustomColors;

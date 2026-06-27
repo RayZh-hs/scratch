@@ -88,6 +88,34 @@ pub struct EditorFontSettings {
     pub line_height: Option<f32>,         // default 1.6
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineCompletionProviderSettings {
+    pub enabled: Option<bool>,
+    pub endpoint: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineCompletionSettings {
+    pub enabled: Option<bool>,
+    pub active_provider: Option<String>,
+    /// "manual" | "pause1s" | "pause5s" | "interval1s" | "interval5s"
+    pub trigger: Option<String>,
+    pub providers: Option<std::collections::HashMap<String, InlineCompletionProviderSettings>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineCompletionShortcutSettings {
+    pub trigger: Option<Vec<String>>,
+    pub accept: Option<Vec<String>>,
+    pub accept_word: Option<Vec<String>>,
+    pub dismiss: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TextDirection {
@@ -124,6 +152,10 @@ pub struct Settings {
     pub custom_editor_width_px: Option<u32>,
     #[serde(rename = "ollamaModel")]
     pub ollama_model: Option<String>,
+    #[serde(rename = "inlineCompletion")]
+    pub inline_completion: Option<InlineCompletionSettings>,
+    #[serde(rename = "inlineCompletionShortcuts")]
+    pub inline_completion_shortcuts: Option<InlineCompletionShortcutSettings>,
     #[serde(rename = "foldersEnabled")]
     pub folders_enabled: Option<bool>,
     #[serde(rename = "ignoredPatterns")]
@@ -150,6 +182,22 @@ pub struct SearchResult {
 pub struct AiExecutionResult {
     pub success: bool,
     pub output: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineCompletionRequest {
+    pub prefix: String,
+    pub suffix: String,
+    pub note_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineCompletionResult {
+    pub success: bool,
+    pub completion: String,
     pub error: Option<String>,
 }
 
@@ -3494,6 +3542,244 @@ async fn ai_execute_ollama(
     }
 }
 
+fn clean_inline_completion_output(text: &str) -> String {
+    // Reasoning models may emit a <think>...</think> block inline (older Ollama
+    // builds, or any OpenAI-compatible endpoint that doesn't split it out).
+    // Drop everything up to and including the closing tag.
+    let text = match text.rfind("</think>") {
+        Some(idx) => &text[idx + "</think>".len()..],
+        None => text,
+    };
+    let mut cleaned = text.trim_matches(|c| c == '\n' || c == '\r').to_string();
+    if cleaned.starts_with("```") {
+        let lines: Vec<&str> = cleaned.lines().collect();
+        if lines.len() >= 2 {
+            let start = 1;
+            let end = if lines.last().is_some_and(|line| line.trim() == "```") {
+                lines.len() - 1
+            } else {
+                lines.len()
+            };
+            cleaned = lines[start..end].join("\n");
+        }
+    }
+    cleaned
+}
+
+fn inline_completion_prompt(request: &InlineCompletionRequest) -> String {
+    format!(
+        "You are completing markdown prose inside a note-taking editor.\n\
+         Return only the text to insert at the cursor.\n\
+         Do not repeat text already present before the cursor.\n\
+         Do not include explanations, labels, or code fences.\n\
+         Keep the completion short: one phrase, sentence, bullet, or paragraph.\n\n\
+         Note title:\n{}\n\n\
+         Text before cursor:\n{}\n\n\
+         Text after cursor:\n{}",
+        request.note_title.as_deref().unwrap_or("Untitled"),
+        request.prefix,
+        request.suffix,
+    )
+}
+
+fn get_inline_provider_config(
+    settings: &Settings,
+) -> Result<(String, InlineCompletionProviderSettings), String> {
+    let inline = settings
+        .inline_completion
+        .as_ref()
+        .ok_or("Inline completion is not configured")?;
+    let provider = inline
+        .active_provider
+        .as_deref()
+        .unwrap_or("disabled")
+        .to_string();
+    if provider == "disabled" {
+        return Err("Inline completion provider is disabled".to_string());
+    }
+
+    let config = inline
+        .providers
+        .as_ref()
+        .and_then(|providers| providers.get(&provider))
+        .cloned()
+        .unwrap_or_default();
+
+    Ok((provider, config))
+}
+
+#[tauri::command]
+async fn ai_inline_complete(
+    request: InlineCompletionRequest,
+    state: State<'_, AppState>,
+) -> Result<InlineCompletionResult, String> {
+    let (provider, config) = {
+        let settings = state.settings.read().expect("settings read lock");
+        get_inline_provider_config(&settings)?
+    };
+
+    let endpoint = config.endpoint.unwrap_or_default();
+    let model = config.model.unwrap_or_default();
+    let api_key = config.api_key.unwrap_or_default();
+    let prompt = inline_completion_prompt(&request);
+
+    if endpoint.trim().is_empty() {
+        return Ok(InlineCompletionResult {
+            success: false,
+            completion: String::new(),
+            error: Some("Inline completion endpoint is empty".to_string()),
+        });
+    }
+    if model.trim().is_empty() {
+        return Ok(InlineCompletionResult {
+            success: false,
+            completion: String::new(),
+            error: Some("Inline completion model is empty".to_string()),
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = match provider.as_str() {
+        "ollama" => {
+            client
+                .post(&endpoint)
+                .json(&serde_json::json!({
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": false,
+                    // Reasoning models (e.g. qwen3) otherwise spend the whole
+                    // num_predict budget inside their hidden thinking phase and
+                    // return an empty `response`. Disabling thinking makes them
+                    // emit the completion directly.
+                    "think": false,
+                    "options": {
+                        "temperature": 0.2,
+                        "num_predict": 120
+                    }
+                }))
+                .send()
+                .await
+        }
+        "anthropic" => {
+            let mut builder = client
+                .post(&endpoint)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .json(&serde_json::json!({
+                    "model": model,
+                    "max_tokens": 160,
+                    "temperature": 0.2,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                }));
+            if !api_key.trim().is_empty() {
+                builder = builder.header("x-api-key", api_key);
+            }
+            builder.send().await
+        }
+        "openai-compatible" => {
+            let mut builder = client
+                .post(&endpoint)
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "model": model,
+                    "temperature": 0.2,
+                    "max_tokens": 160,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return only insertion text for inline markdown completion."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                }));
+            if !api_key.trim().is_empty() {
+                builder = builder.bearer_auth(api_key);
+            }
+            builder.send().await
+        }
+        _ => {
+            return Ok(InlineCompletionResult {
+                success: false,
+                completion: String::new(),
+                error: Some(format!("Unsupported inline completion provider: {}", provider)),
+            });
+        }
+    };
+
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            return Ok(InlineCompletionResult {
+                success: false,
+                completion: String::new(),
+                error: Some(format!("Inline completion request failed: {}", e)),
+            });
+        }
+    };
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Ok(InlineCompletionResult {
+            success: false,
+            completion: String::new(),
+            error: Some(format!("Provider returned {}: {}", status, body)),
+        });
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse provider response: {}", e))?;
+    let raw_completion = match provider.as_str() {
+        "ollama" => json
+            .get("response")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+        "anthropic" => json
+            .get("content")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+        "openai-compatible" => json
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+        _ => "",
+    };
+    let completion = clean_inline_completion_output(raw_completion);
+
+    if completion.trim().is_empty() {
+        return Ok(InlineCompletionResult {
+            success: false,
+            completion: String::new(),
+            error: Some("Provider returned an empty completion".to_string()),
+        });
+    }
+
+    Ok(InlineCompletionResult {
+        success: true,
+        completion,
+        error: None,
+    })
+}
+
 /// Check if a markdown file is inside the configured notes folder.
 /// If so, emit a "select-note" event to the main window and focus it, returning true.
 /// Returns false on any failure so callers can fall back to create_preview_window.
@@ -3854,6 +4140,7 @@ pub fn run() {
             ai_execute_codex,
             ai_execute_opencode,
             ai_execute_ollama,
+            ai_inline_complete,
             read_file_direct,
             save_file_direct,
             import_file_to_folder,

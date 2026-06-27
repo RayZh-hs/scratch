@@ -388,6 +388,12 @@ html.dark {
   color: var(--color-text);
 }
 
+.inline-ai-ghost-text {
+  color: color-mix(in srgb, var(--color-text-muted) 62%, transparent);
+  pointer-events: none;
+  white-space: pre-wrap;
+}
+
 /* Code blocks and inline code */
 .prose :where(code):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
   color: var(--color-code);

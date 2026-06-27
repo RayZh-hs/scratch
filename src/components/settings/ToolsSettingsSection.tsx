@@ -1,7 +1,7 @@
 import { useState, useEffect, useReducer } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Button } from "../ui";
+import { Button, Input, Select } from "../ui";
 import {
   SpinnerIcon,
   CheckIcon,
@@ -15,6 +15,12 @@ import * as aiService from "../../services/ai";
 import { mod } from "../../lib/platform";
 import * as cliService from "../../services/cli";
 import type { CliStatus } from "../../services/cli";
+import type {
+  InlineCompletionProviderId,
+  InlineCompletionSettings,
+  InlineCompletionTrigger,
+  Settings,
+} from "../../types/note";
 
 type CliState = {
   status: CliStatus | null;
@@ -94,10 +100,135 @@ const AI_PROVIDER_INFO: Record<
   },
 };
 
+const INLINE_COMPLETION_PROVIDER_ORDER: InlineCompletionProviderId[] = [
+  "ollama",
+  "openai-compatible",
+  "anthropic",
+  "disabled",
+];
+
+const INLINE_COMPLETION_TRIGGER_OPTIONS: {
+  value: InlineCompletionTrigger;
+  label: string;
+}[] = [
+  { value: "manual", label: "Manual Only" },
+  { value: "pause1s", label: "After 1s Pause" },
+  { value: "pause5s", label: "After 5s Pause" },
+  { value: "interval1s", label: "Every 1s" },
+  { value: "interval5s", label: "Every 5s" },
+];
+
+const INLINE_COMPLETION_PROVIDER_INFO: Record<
+  InlineCompletionProviderId,
+  {
+    name: string;
+    description: string;
+    endpointPlaceholder: string;
+    modelPlaceholder: string;
+    apiKeyPlaceholder: string;
+  }
+> = {
+  disabled: {
+    name: "Disabled",
+    description: "",
+    endpointPlaceholder: "",
+    modelPlaceholder: "",
+    apiKeyPlaceholder: "",
+  },
+  "openai-compatible": {
+    name: "OpenAI-compatible",
+    description: "Use any completions endpoint with an OpenAI-style API.",
+    endpointPlaceholder: "https://api.openai.com/v1/chat/completions",
+    modelPlaceholder: "gpt-4.1-mini",
+    apiKeyPlaceholder: "sk-...",
+  },
+  anthropic: {
+    name: "Anthropic",
+    description: "Use Claude models through the Anthropic Messages API.",
+    endpointPlaceholder: "https://api.anthropic.com/v1/messages",
+    modelPlaceholder: "claude-3-5-haiku-latest",
+    apiKeyPlaceholder: "sk-ant-...",
+  },
+  ollama: {
+    name: "Ollama",
+    description: "Use a local Ollama model for private inline completions.",
+    endpointPlaceholder: "http://localhost:11434/api/generate",
+    modelPlaceholder: "qwen3:8b",
+    apiKeyPlaceholder: "Optional",
+  },
+};
+
+function defaultInlineCompletionSettings(): InlineCompletionSettings {
+  return {
+    enabled: false,
+    activeProvider: "disabled",
+    trigger: "manual",
+    providers: {
+      "openai-compatible": {
+        enabled: false,
+        endpoint: "",
+        apiKey: "",
+        model: "",
+      },
+      anthropic: {
+        enabled: false,
+        endpoint: "",
+        apiKey: "",
+        model: "",
+      },
+      disabled: {
+        enabled: false,
+        endpoint: "",
+        apiKey: "",
+        model: "",
+      },
+      ollama: {
+        enabled: true,
+        endpoint: "http://localhost:11434/api/generate",
+        apiKey: "",
+        model: "qwen3:8b",
+      },
+    },
+  };
+}
+
+function normalizeInlineCompletionSettings(
+  settings?: InlineCompletionSettings,
+): InlineCompletionSettings {
+  const defaults = defaultInlineCompletionSettings();
+  return {
+    ...defaults,
+    ...settings,
+    providers: {
+      ...defaults.providers,
+      ...(settings?.providers ?? {}),
+    },
+  };
+}
+
+function redactInlineCompletionSettings(settings: InlineCompletionSettings) {
+  return {
+    ...settings,
+    providers: Object.fromEntries(
+      Object.entries(settings.providers ?? {}).map(([provider, config]) => [
+        provider,
+        {
+          ...config,
+          apiKey: config?.apiKey ? "<redacted>" : "",
+        },
+      ]),
+    ),
+  };
+}
+
 export function ToolsSettingsSection() {
   const [cli, dispatchCli] = useReducer(cliReducer, cliInitialState);
   const [aiProviders, setAiProviders] = useState<AiProvider[]>([]);
   const [aiProvidersLoading, setAiProvidersLoading] = useState(true);
+  const [inlineCompletion, setInlineCompletion] =
+    useState<InlineCompletionSettings>(defaultInlineCompletionSettings);
+  const [inlineCompletionLoading, setInlineCompletionLoading] = useState(true);
+  const [inlineCompletionSaving, setInlineCompletionSaving] = useState(false);
 
   useEffect(() => {
     cliService
@@ -116,6 +247,94 @@ export function ToolsSettingsSection() {
       .catch(() => setAiProviders([]))
       .finally(() => setAiProvidersLoading(false));
   }, []);
+
+  useEffect(() => {
+    invoke<Settings>("get_settings")
+      .then((settings) => {
+        const normalized = normalizeInlineCompletionSettings(
+          settings.inlineCompletion,
+        );
+        console.info(
+          "[InlineCompletionSettings] loaded",
+          redactInlineCompletionSettings(normalized),
+        );
+        setInlineCompletion(normalized);
+      })
+      .catch((err) => {
+        console.error("[InlineCompletionSettings] failed to load", err);
+        toast.error("Failed to load inline completion settings");
+      })
+      .finally(() => setInlineCompletionLoading(false));
+  }, []);
+
+  const saveInlineCompletionSettings = async (
+    next: InlineCompletionSettings,
+  ) => {
+    const normalized = normalizeInlineCompletionSettings(next);
+    setInlineCompletion(normalized);
+    setInlineCompletionSaving(true);
+    console.info(
+      "[InlineCompletionSettings] saving",
+      redactInlineCompletionSettings(normalized),
+    );
+    try {
+      const settings = await invoke<Settings>("get_settings");
+      await invoke("update_settings", {
+        newSettings: {
+          ...settings,
+          inlineCompletion: normalized,
+        },
+      });
+      window.dispatchEvent(new CustomEvent("settings-updated"));
+      console.info(
+        "[InlineCompletionSettings] saved",
+        redactInlineCompletionSettings(normalized),
+      );
+    } catch (err) {
+      console.error("[InlineCompletionSettings] failed to save", err);
+      toast.error("Failed to save inline completion settings");
+    } finally {
+      setInlineCompletionSaving(false);
+    }
+  };
+
+  const updateInlineCompletionLocal = (
+    provider: InlineCompletionProviderId,
+    field: "endpoint" | "apiKey" | "model",
+    value: string,
+  ) => {
+    setInlineCompletion((prev) => {
+      const normalized = normalizeInlineCompletionSettings(prev);
+      return {
+        ...normalized,
+        providers: {
+          ...normalized.providers,
+          [provider]: {
+            ...normalized.providers?.[provider],
+            [field]: value,
+          },
+        },
+      };
+    });
+  };
+
+  const persistInlineProviderField = (
+    provider: InlineCompletionProviderId,
+    field: "endpoint" | "apiKey" | "model",
+  ) => {
+    const normalized = normalizeInlineCompletionSettings(inlineCompletion);
+    console.info("[InlineCompletionSettings] field blur", {
+      provider,
+      field,
+      value:
+        field === "apiKey"
+          ? normalized.providers?.[provider]?.apiKey
+            ? "<redacted>"
+            : ""
+          : normalized.providers?.[provider]?.[field],
+    });
+    void saveInlineCompletionSettings(normalized);
+  };
 
   const handleInstallCli = async () => {
     dispatchCli({ type: "operating" });
@@ -201,6 +420,153 @@ export function ToolsSettingsSection() {
               );
             })}
           </div>
+        )}
+      </section>
+
+      <div className="border-t border-border border-dashed" />
+
+      {/* Inline Completion Providers */}
+      <section className="pb-2">
+        <div className="mb-4">
+          <h2 className="text-xl font-medium mb-0.5">
+            Inline Completion Providers
+          </h2>
+          <p className="text-sm text-text-muted">
+            Configure providers for ghost text completions in the editor
+          </p>
+        </div>
+
+        {inlineCompletionLoading ? (
+          <div className="flex items-center gap-2 p-3">
+            <SpinnerIcon className="w-4 h-4 animate-spin text-text-muted" />
+            <span className="text-sm text-text-muted">
+              Loading inline completion settings...
+            </span>
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-[minmax(12rem,1fr)_minmax(16rem,20rem)] items-center gap-6">
+              <label className="text-sm font-medium text-text">
+                Active provider
+              </label>
+              <Select
+                value={inlineCompletion.activeProvider ?? "disabled"}
+                disabled={inlineCompletionSaving}
+                onChange={(e) => {
+                  const activeProvider = e.target
+                    .value as InlineCompletionProviderId;
+                  void saveInlineCompletionSettings({
+                    ...normalizeInlineCompletionSettings(inlineCompletion),
+                    enabled: activeProvider !== "disabled",
+                    activeProvider,
+                  });
+                }}
+              >
+                {INLINE_COMPLETION_PROVIDER_ORDER.map((provider) => (
+                  <option key={provider} value={provider}>
+                    {INLINE_COMPLETION_PROVIDER_INFO[provider].name}
+                  </option>
+                ))}
+              </Select>
+
+              <label className="text-sm font-medium text-text">Trigger</label>
+              <Select
+                value={inlineCompletion.trigger ?? "manual"}
+                disabled={
+                  inlineCompletionSaving ||
+                  inlineCompletion.activeProvider === "disabled"
+                }
+                onChange={(e) => {
+                  const trigger = e.target.value as InlineCompletionTrigger;
+                  void saveInlineCompletionSettings({
+                    ...normalizeInlineCompletionSettings(inlineCompletion),
+                    trigger,
+                  });
+                }}
+              >
+                {INLINE_COMPLETION_TRIGGER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </Select>
+            </div>
+
+            {inlineCompletion.activeProvider &&
+              inlineCompletion.activeProvider !== "disabled" &&
+              (() => {
+                const provider = inlineCompletion.activeProvider;
+                const info = INLINE_COMPLETION_PROVIDER_INFO[provider];
+                const config = normalizeInlineCompletionSettings(
+                  inlineCompletion,
+                ).providers?.[provider];
+                return (
+                  <div className="mt-4 border-border border-dashed space-y-3">
+                    <div className="grid grid-cols-[minmax(12rem,1fr)_minmax(16rem,20rem)] items-center gap-6">
+                      <label className="text-sm font-medium text-text">
+                        Endpoint
+                      </label>
+                      <Input
+                        value={config?.endpoint ?? ""}
+                        onChange={(e) =>
+                          updateInlineCompletionLocal(
+                            provider,
+                            "endpoint",
+                            e.target.value,
+                          )
+                        }
+                        onBlur={() =>
+                          persistInlineProviderField(provider, "endpoint")
+                        }
+                        placeholder={info.endpointPlaceholder}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="grid grid-cols-[minmax(12rem,1fr)_minmax(16rem,20rem)] items-center gap-6">
+                      <label className="text-sm font-medium text-text">
+                        API key
+                      </label>
+                      <Input
+                        type="password"
+                        value={config?.apiKey ?? ""}
+                        onChange={(e) =>
+                          updateInlineCompletionLocal(
+                            provider,
+                            "apiKey",
+                            e.target.value,
+                          )
+                        }
+                        onBlur={() =>
+                          persistInlineProviderField(provider, "apiKey")
+                        }
+                        placeholder={info.apiKeyPlaceholder}
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="grid grid-cols-[minmax(12rem,1fr)_minmax(16rem,20rem)] items-center gap-6">
+                      <label className="text-sm font-medium text-text">
+                        Model ID
+                      </label>
+                      <Input
+                        value={config?.model ?? ""}
+                        onChange={(e) =>
+                          updateInlineCompletionLocal(
+                            provider,
+                            "model",
+                            e.target.value,
+                          )
+                        }
+                        onBlur={() =>
+                          persistInlineProviderField(provider, "model")
+                        }
+                        placeholder={info.modelPlaceholder}
+                        autoComplete="off"
+                      />
+                    </div>
+                  </div>
+                );
+              })()}
+          </>
         )}
       </section>
 

@@ -14,6 +14,18 @@ export interface AiExecutionResult {
   error: string | null;
 }
 
+export interface InlineCompletionRequest {
+  prefix: string;
+  suffix: string;
+  noteTitle?: string;
+}
+
+export interface InlineCompletionResult {
+  success: boolean;
+  completion: string;
+  error: string | null;
+}
+
 export async function checkClaudeCli(): Promise<boolean> {
   return invoke("ai_check_claude_cli");
 }
@@ -79,4 +91,10 @@ export async function executeOllamaEdit(
   model: string
 ): Promise<AiExecutionResult> {
   return invoke("ai_execute_ollama", { filePath, prompt, model });
+}
+
+export async function executeInlineCompletion(
+  request: InlineCompletionRequest,
+): Promise<InlineCompletionResult> {
+  return invoke("ai_inline_complete", { request });
 }
