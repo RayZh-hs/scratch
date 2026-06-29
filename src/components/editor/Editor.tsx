@@ -25,6 +25,7 @@ import { lowlight } from "./lowlight";
 import { CodeBlockView } from "./CodeBlockView";
 import { Extension, InputRule } from "@tiptap/core";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
+import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import {
   NodeSelection,
   Plugin,
@@ -133,6 +134,23 @@ function formatDateTime(timestamp: number): string {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+// Serialize leaf/atom nodes when extracting plain text for inline completion.
+// Without this, `textBetween` drops atoms (their content lives in attributes,
+// not as child text), so math like `$a+b$` vanishes from the prefix/suffix and
+// the model loses the very context it needs to continue.
+function serializeLeafForCompletion(leafNode: ProseMirrorNode): string {
+  switch (leafNode.type.name) {
+    case "inlineMath":
+      return `$${leafNode.attrs.latex ?? ""}$`;
+    case "blockMath":
+      return `$$${leafNode.attrs.latex ?? ""}$$`;
+    case "hardBreak":
+      return "\n";
+    default:
+      return leafNode.textContent;
+  }
 }
 
 function focusAndSelectTitle(editor: TiptapEditor): boolean {
@@ -1108,8 +1126,13 @@ export function Editor({
     clearInlineCompletionGhostText(currentEditor, "new-request");
 
     const doc = currentEditor.state.doc;
-    const rawPrefix = doc.textBetween(0, from, "\n\n");
-    const rawSuffix = doc.textBetween(from, doc.content.size, "\n\n");
+    const rawPrefix = doc.textBetween(0, from, "\n\n", serializeLeafForCompletion);
+    const rawSuffix = doc.textBetween(
+      from,
+      doc.content.size,
+      "\n\n",
+      serializeLeafForCompletion,
+    );
     const prefix = rawPrefix.slice(-4000);
     const suffix = rawSuffix.slice(0, 1000);
 

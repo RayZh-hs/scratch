@@ -3567,15 +3567,27 @@ fn clean_inline_completion_output(text: &str) -> String {
 }
 
 fn inline_completion_prompt(request: &InlineCompletionRequest) -> String {
+    // Framing matters here: instruct/chat models are trained to emit complete,
+    // standalone sentences, so given a prefix that ends mid-sentence they tend to
+    // *restart* it (re-capitalizing and duplicating the trailing words) instead of
+    // continuing from the cursor. Marking the exact insertion point inline with a
+    // sentinel and demanding seamless continuation suppresses that restart bias.
     format!(
-        "You are completing markdown prose inside a note-taking editor.\n\
-         Return only the text to insert at the cursor.\n\
-         Do not repeat text already present before the cursor.\n\
-         Do not include explanations, labels, or code fences.\n\
-         Keep the completion short: one phrase, sentence, bullet, or paragraph.\n\n\
-         Note title:\n{}\n\n\
-         Text before cursor:\n{}\n\n\
-         Text after cursor:\n{}",
+        "You are an inline autocomplete engine inside a markdown note editor. \
+         The cursor position is marked by <|cursor|>.\n\
+         Output ONLY the text to insert at <|cursor|> — nothing else: no preamble, \
+         no quotes, no code fences, no labels.\n\
+         Your output is concatenated verbatim between the text before and after the \
+         cursor, so:\n\
+         - Do NOT restate, rephrase, or re-capitalize any text that already appears \
+         before the cursor.\n\
+         - The text before the cursor may end mid-word or mid-sentence; continue it \
+         seamlessly from that exact point, preserving its case and spacing.\n\
+         - Include a leading space only if one is needed to join your text to it.\n\
+         Keep it short: finish the current word, phrase, or sentence — at most a \
+         short paragraph.\n\n\
+         Note title: {}\n\n\
+         <document>\n{}<|cursor|>{}\n</document>",
         request.note_title.as_deref().unwrap_or("Untitled"),
         request.prefix,
         request.suffix,
@@ -3696,7 +3708,7 @@ async fn ai_inline_complete(
                     "messages": [
                         {
                             "role": "system",
-                            "content": "Return only insertion text for inline markdown completion."
+                            "content": "You are an inline autocomplete engine. Return only the raw text to insert at the cursor, continuing the existing text seamlessly without restating or re-capitalizing anything before it."
                         },
                         {
                             "role": "user",
