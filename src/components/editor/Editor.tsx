@@ -25,7 +25,10 @@ import { lowlight } from "./lowlight";
 import { CodeBlockView } from "./CodeBlockView";
 import { Extension, InputRule } from "@tiptap/core";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
-import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
+import type {
+  Mark as ProseMirrorMark,
+  Node as ProseMirrorNode,
+} from "@tiptap/pm/model";
 import {
   NodeSelection,
   Plugin,
@@ -151,6 +154,91 @@ function serializeLeafForCompletion(leafNode: ProseMirrorNode): string {
     default:
       return leafNode.textContent;
   }
+}
+
+// Markdown delimiters for the inline marks our schema supports. `code` is
+// innermost because its content isn't parsed for further markup; the styling
+// marks wrap around it, link wraps outermost.
+const COMPLETION_MARK_DELIMITERS: Array<{
+  name: string;
+  open: string;
+  close: string;
+}> = [
+  { name: "code", open: "`", close: "`" },
+  { name: "strike", open: "~~", close: "~~" },
+  { name: "italic", open: "*", close: "*" },
+  { name: "bold", open: "**", close: "**" },
+];
+
+// Re-apply markdown markup to a text run based on its marks. Plain `textBetween`
+// throws marks away, so styled spans like **Lightning Indexer** reach the model
+// as bare text — losing formatting context and making the model more likely to
+// restate styled entities verbatim.
+function wrapMarksForCompletion(
+  text: string,
+  marks: readonly ProseMirrorMark[],
+): string {
+  if (!text) return text;
+  let result = text;
+  for (const { name, open, close } of COMPLETION_MARK_DELIMITERS) {
+    if (marks.some((mark) => mark.type.name === name)) {
+      result = `${open}${result}${close}`;
+    }
+  }
+  const link = marks.find((mark) => mark.type.name === "link");
+  if (link) {
+    const href = (link.attrs.href as string | undefined) ?? "";
+    result = `[${result}](${href})`;
+  }
+  return result;
+}
+
+// Mark-aware version of `doc.textBetween`: mirrors its block-separator and
+// leaf-text handling but re-applies markdown markup to text runs so the inline
+// completion model sees formatting (bold, italic, links, …) in the context.
+function serializeRangeForCompletion(
+  doc: ProseMirrorNode,
+  from: number,
+  to: number,
+): string {
+  let text = "";
+  let first = true;
+  doc.nodesBetween(from, to, (node, pos) => {
+    let nodeText = "";
+    if (node.isText) {
+      const run = node.text?.slice(Math.max(from, pos) - pos, to - pos) ?? "";
+      nodeText = wrapMarksForCompletion(run, node.marks);
+    } else if (node.isLeaf) {
+      nodeText = serializeLeafForCompletion(node);
+    }
+    if (node.isBlock && ((node.isLeaf && nodeText) || node.isTextblock)) {
+      if (first) first = false;
+      else text += "\n\n";
+    }
+    text += nodeText;
+  });
+  return text;
+}
+
+// The model is told not to restate text before the cursor, but instruct models
+// have a strong "restart" bias and often regenerate the trailing clause anyway
+// (cursor after "…which adopts a" → completion "Lightning Indexer, which adopts
+// a novel approach…"). Strip the longest head of the completion that duplicates
+// the tail of the existing text so the duplicate never reaches the ghost text.
+// Compares against the plain-text prefix, case-insensitively, within a bounded
+// window.
+function trimCompletionOverlap(plainPrefix: string, completion: string): string {
+  if (!plainPrefix || !completion) return completion;
+  const tail = plainPrefix.slice(-200);
+  const tailLower = tail.toLowerCase();
+  const completionLower = completion.toLowerCase();
+  const max = Math.min(tail.length, completion.length);
+  for (let k = max; k > 0; k--) {
+    if (tailLower.endsWith(completionLower.slice(0, k))) {
+      return completion.slice(k);
+    }
+  }
+  return completion;
 }
 
 function focusAndSelectTitle(editor: TiptapEditor): boolean {
@@ -1126,15 +1214,18 @@ export function Editor({
     clearInlineCompletionGhostText(currentEditor, "new-request");
 
     const doc = currentEditor.state.doc;
-    const rawPrefix = doc.textBetween(0, from, "\n\n", serializeLeafForCompletion);
-    const rawSuffix = doc.textBetween(
+    // Markdown-aware context for the model (keeps **bold**, *italic*, links, …).
+    const prefix = serializeRangeForCompletion(doc, 0, from).slice(-4000);
+    const suffix = serializeRangeForCompletion(
+      doc,
       from,
       doc.content.size,
-      "\n\n",
-      serializeLeafForCompletion,
-    );
-    const prefix = rawPrefix.slice(-4000);
-    const suffix = rawSuffix.slice(0, 1000);
+    ).slice(0, 1000);
+    // Plain-text tail for overlap trimming — the model emits plain text, so we
+    // dedupe against the unmarked prefix.
+    const plainPrefix = doc
+      .textBetween(0, from, "\n\n", serializeLeafForCompletion)
+      .slice(-4000);
 
     console.info("[InlineCompletionGhostText] provider request", {
       requestId,
@@ -1178,11 +1269,16 @@ export function Editor({
         return;
       }
 
-      showInlineCompletionGhostText(
-        currentEditor,
-        result.completion,
-        requestId,
-      );
+      const completion = trimCompletionOverlap(plainPrefix, result.completion);
+      if (!completion.trim()) {
+        console.info(
+          "[InlineCompletionGhostText] dropped fully-duplicate suggestion",
+          { requestId },
+        );
+        return;
+      }
+
+      showInlineCompletionGhostText(currentEditor, completion, requestId);
     } catch (err) {
       console.error("[InlineCompletionGhostText] provider request failed", err);
     }
